@@ -1,0 +1,43 @@
+# ---- .NET ----
+bin/
+obj/
+out/
+*.user
+*.suo
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+project.lock.json
+.vs/
+
+# ---- Logs ----
+logs/
+*.log
+
+# ---- EF / local data ----
+*.db
+*.db-shm
+*.db-wal
+
+# ---- Node / Angular ----
+node_modules/
+dist/
+.angular/
+npm-debug.log*
+yarn-error.log*
+
+# ---- Secrets / env ----
+.env
+.env.*
+!.env.example
+appsettings.*.local.json
+secrets.json
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- IDE ----
+.idea/
+*.swp
+.vscode/

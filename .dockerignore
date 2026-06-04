@@ -1,0 +1,11 @@
+**/bin
+**/obj
+**/node_modules
+**/dist
+**/.angular
+**/logs
+**/.git
+**/.vs
+**/.idea
+**/*.user
+.DS_Store

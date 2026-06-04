@@ -1,0 +1,11 @@
+# Override SOMENTE para verificação local nesta máquina (evita conflito de portas
+# com outro stack em execução). Não afeta a comunicação interna entre containers.
+services:
+  mysql:
+    ports: !override ["3307:3306"]
+  kafka:
+    ports: !override ["9094:9092"]
+  api:
+    ports: !override ["5080:8080"]
+  frontend:
+    ports: !override ["8090:80"]

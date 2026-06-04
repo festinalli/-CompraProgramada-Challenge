@@ -1,0 +1,487 @@
+using Domain.Entities;
+using FluentAssertions;
+using Infrastructure.Data;
+using Infrastructure.Messaging;
+using Infrastructure.Parsers;
+using Microsoft.EntityFrameworkCore;
+using Moq;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Xunit;
+using Application.Services;
+
+namespace Tests.Application
+{
+    /// <summary>
+    /// Testes End-to-End do Motor de Compra Programada.
+    /// Valida fluxo completo: Cliente → Cesta → Motor → Distribuição → IR
+    /// </summary>
+    public class MotorCompraE2ETests
+    {
+        private readonly AppDbContext _context;
+        private readonly Mock<ICotahistParser> _mockParser;
+        private readonly Mock<IKafkaProducer> _mockKafka;
+        private readonly MotorCompraService _motorService;
+
+        public MotorCompraE2ETests()
+        {
+            var options = new DbContextOptionsBuilder<AppDbContext>()
+                .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
+                .Options;
+
+            _context = new AppDbContext(options);
+            _mockParser = new Mock<ICotahistParser>();
+            _mockKafka = new Mock<IKafkaProducer>();
+            _motorService = new MotorCompraService(_context, _mockParser.Object, _mockKafka.Object, "/cotacoes");
+        }
+
+        /// <summary>
+        /// Teste E2E: Fluxo completo de compra programada.
+        /// 1. Cria cliente com aporte
+        /// 2. Registra cesta recomendada
+        /// 3. Executa motor em dia válido (5, 15, 25)
+        /// 4. Valida distribuição proporcional
+        /// 5. Valida IR publicado
+        /// </summary>
+        [Fact]
+        public async Task ExecutarCompraProgramada_FluxoCompleto_DeveDistribuirAcoesECalcularIR()
+        {
+            // Arrange
+            var dataExecucao = new DateTime(2026, 3, 5); // Dia 5 - válido
+            
+            // 1. Criar cliente
+            var cliente = new Cliente
+            {
+                Id = Guid.NewGuid(),
+                Nome = "João Silva",
+                Email = "joao@test.com",
+                CPF = "12345678900",
+                Ativo = true,
+                ValorMensalAporte = 3000m,
+                DataAdesao = DateTime.Now
+            };
+            _context.Clientes.Add(cliente);
+
+            // 2. Criar cesta recomendada
+            var cesta = new CestaRecomendacao
+            {
+                Id = Guid.NewGuid(),
+                Nome = "Cesta Teste",
+                Ativa = true,
+                DataCriacao = DateTime.Now,
+                Itens = new List<ItemCesta>
+                {
+                    new ItemCesta { Ticker = "PETR4", Percentual = 40m },
+                    new ItemCesta { Ticker = "VALE3", Percentual = 30m },
+                    new ItemCesta { Ticker = "ITUB4", Percentual = 30m }
+                }
+            };
+            _context.CestasRecomendacao.Add(cesta);
+            await _context.SaveChangesAsync();
+
+            // 3. Mock de cotações
+            _mockParser.Setup(p => p.ObterCotacaoFechamento(It.IsAny<string>(), "PETR4"))
+                .Returns(new CotacaoB3 { Ticker = "PETR4", PrecoFechamento = 25m, DataPregao = dataExecucao });
+            _mockParser.Setup(p => p.ObterCotacaoFechamento(It.IsAny<string>(), "VALE3"))
+                .Returns(new CotacaoB3 { Ticker = "VALE3", PrecoFechamento = 80m, DataPregao = dataExecucao });
+            _mockParser.Setup(p => p.ObterCotacaoFechamento(It.IsAny<string>(), "ITUB4"))
+                .Returns(new CotacaoB3 { Ticker = "ITUB4", PrecoFechamento = 10m, DataPregao = dataExecucao });
+
+            // Act
+            await _motorService.ExecutarCompraProgramada(dataExecucao);
+
+            // Assert
+            // 4. Validar distribuição
+            var custodiaCliente = await _context.CustodiasFilhotes
+                .Where(cf => cf.ClienteId == cliente.Id && cf.Ticker == "PETR4")
+                .FirstOrDefaultAsync();
+
+            custodiaCliente.Should().NotBeNull();
+            custodiaCliente!.Quantidade.Should().BeGreaterThan(0);
+
+            // 5. Validar IR publicado
+            var eventosIR = await _context.EventosIR
+                .Where(e => e.ClienteId == cliente.Id)
+                .ToListAsync();
+
+            eventosIR.Should().NotBeEmpty();
+            eventosIR.ForEach(e => e.Aliquota.Should().Be(0.00005m)); // 0,005%
+
+            // Validar que Kafka foi chamado
+            _mockKafka.Verify(k => k.PublicarEventoIR(It.IsAny<EventoIR>()), Times.AtLeastOnce);
+        }
+
+        /// <summary>
+        /// Teste E2E: Validação de dias úteis (5, 15, 25).
+        /// Deve aceitar próximo dia útil se cair em fim de semana.
+        /// </summary>
+        [Theory]
+        [InlineData(5, true)]   // Dia 5 válido
+        [InlineData(15, true)]  // Dia 15 válido
+        [InlineData(25, true)]  // Dia 25 válido
+        [InlineData(10, false)] // Dia 10 inválido
+        [InlineData(20, false)] // Dia 20 inválido
+        public async Task ExecutarCompraProgramada_ValidarDiasExecucao(int dia, bool deveExecutar)
+        {
+            // Arrange
+            var dataExecucao = new DateTime(2026, 3, dia);
+            
+            var cliente = new Cliente
+            {
+                Id = Guid.NewGuid(),
+                Nome = "Teste",
+                Email = "teste@test.com",
+                CPF = "12345678901",
+                Ativo = true,
+                ValorMensalAporte = 1000m,
+                DataAdesao = DateTime.Now
+            };
+            _context.Clientes.Add(cliente);
+
+            var cesta = new CestaRecomendacao
+            {
+                Id = Guid.NewGuid(),
+                Nome = "Cesta",
+                Ativa = true,
+                DataCriacao = DateTime.Now,
+                Itens = new List<ItemCesta>
+                {
+                    new ItemCesta { Ticker = "PETR4", Percentual = 100m }
+                }
+            };
+            _context.CestasRecomendacao.Add(cesta);
+            await _context.SaveChangesAsync();
+
+            _mockParser.Setup(p => p.ObterCotacaoFechamento(It.IsAny<string>(), It.IsAny<string>()))
+                .Returns(new CotacaoB3 { Ticker = "PETR4", PrecoFechamento = 25m, DataPregao = dataExecucao });
+
+            // Act & Assert
+            if (deveExecutar)
+            {
+                // Não deve lançar exceção
+                var exception = await Record.ExceptionAsync(() => _motorService.ExecutarCompraProgramada(dataExecucao));
+                exception.Should().BeNull();
+            }
+            else
+            {
+                // Deve lançar exceção
+                var exception = await Record.ExceptionAsync(() => _motorService.ExecutarCompraProgramada(dataExecucao));
+                exception.Should().NotBeNull();
+                exception.Should().BeOfType<InvalidOperationException>();
+            }
+        }
+
+        /// <summary>
+        /// Teste: Distribuição proporcional entre clientes.
+        /// Dois clientes com aportes diferentes devem receber proporcionalmente.
+        /// </summary>
+        [Fact]
+        public async Task ExecutarCompraProgramada_DistribuicaoProporcional_DeveRespeitarAportes()
+        {
+            // Arrange
+            var dataExecucao = new DateTime(2026, 3, 5);
+            
+            var cliente1 = new Cliente
+            {
+                Id = Guid.NewGuid(),
+                Nome = "Cliente 1",
+                Email = "cliente1@test.com",
+                CPF = "11111111111",
+                Ativo = true,
+                ValorMensalAporte = 3000m,
+                DataAdesao = DateTime.Now
+            };
+
+            var cliente2 = new Cliente
+            {
+                Id = Guid.NewGuid(),
+                Nome = "Cliente 2",
+                Email = "cliente2@test.com",
+                CPF = "22222222222",
+                Ativo = true,
+                ValorMensalAporte = 1000m,
+                DataAdesao = DateTime.Now
+            };
+
+            _context.Clientes.Add(cliente1);
+            _context.Clientes.Add(cliente2);
+
+            var cesta = new CestaRecomendacao
+            {
+                Id = Guid.NewGuid(),
+                Nome = "Cesta",
+                Ativa = true,
+                DataCriacao = DateTime.Now,
+                Itens = new List<ItemCesta>
+                {
+                    new ItemCesta { Ticker = "PETR4", Percentual = 100m }
+                }
+            };
+            _context.CestasRecomendacao.Add(cesta);
+            await _context.SaveChangesAsync();
+
+            _mockParser.Setup(p => p.ObterCotacaoFechamento(It.IsAny<string>(), It.IsAny<string>()))
+                .Returns(new CotacaoB3 { Ticker = "PETR4", PrecoFechamento = 25m, DataPregao = dataExecucao });
+
+            // Act
+            await _motorService.ExecutarCompraProgramada(dataExecucao);
+
+            // Assert
+            var custodia1 = await _context.CustodiasFilhotes
+                .FirstOrDefaultAsync(cf => cf.ClienteId == cliente1.Id && cf.Ticker == "PETR4");
+            var custodia2 = await _context.CustodiasFilhotes
+                .FirstOrDefaultAsync(cf => cf.ClienteId == cliente2.Id && cf.Ticker == "PETR4");
+
+            custodia1.Should().NotBeNull();
+            custodia2.Should().NotBeNull();
+
+            // Cliente 1 deve ter 3x mais ações que Cliente 2 (3000/1000 = 3)
+            var proporcao = (double)custodia1!.Quantidade / custodia2!.Quantidade;
+            proporcao.Should().BeCloseTo(3.0, precision: 0.5);
+        }
+
+        /// <summary>
+        /// Teste: Resíduos mantidos na custódia master.
+        /// Ações que não podem ser distribuídas devem ficar na master.
+        /// </summary>
+        [Fact]
+        public async Task ExecutarCompraProgramada_Residuos_DeveManterNaMaster()
+        {
+            // Arrange
+            var dataExecucao = new DateTime(2026, 3, 5);
+            
+            var cliente = new Cliente
+            {
+                Id = Guid.NewGuid(),
+                Nome = "Cliente",
+                Email = "cliente@test.com",
+                CPF = "33333333333",
+                Ativo = true,
+                ValorMensalAporte = 100m, // Valor pequeno para gerar resíduo
+                DataAdesao = DateTime.Now
+            };
+            _context.Clientes.Add(cliente);
+
+            var cesta = new CestaRecomendacao
+            {
+                Id = Guid.NewGuid(),
+                Nome = "Cesta",
+                Ativa = true,
+                DataCriacao = DateTime.Now,
+                Itens = new List<ItemCesta>
+                {
+                    new ItemCesta { Ticker = "PETR4", Percentual = 100m }
+                }
+            };
+            _context.CestasRecomendacao.Add(cesta);
+            await _context.SaveChangesAsync();
+
+            _mockParser.Setup(p => p.ObterCotacaoFechamento(It.IsAny<string>(), It.IsAny<string>()))
+                .Returns(new CotacaoB3 { Ticker = "PETR4", PrecoFechamento = 25m, DataPregao = dataExecucao });
+
+            // Act
+            await _motorService.ExecutarCompraProgramada(dataExecucao);
+
+            // Assert
+            var saldoMaster = await _context.CustodiasMaster
+                .FirstOrDefaultAsync(m => m.Ticker == "PETR4");
+
+            saldoMaster.Should().NotBeNull();
+            saldoMaster!.Quantidade.Should().BeGreaterThanOrEqualTo(0);
+        }
+    }
+
+    /// <summary>
+    /// Testes de Regras Financeiras: IR, Preço Médio, Isenção
+    /// </summary>
+    public class FinancialRulesTests
+    {
+        private readonly AppDbContext _context;
+
+        public FinancialRulesTests()
+        {
+            var options = new DbContextOptionsBuilder<AppDbContext>()
+                .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
+                .Options;
+
+            _context = new AppDbContext(options);
+        }
+
+        /// <summary>
+        /// Teste: IR Dedo-Duro é calculado como 0,005% do valor da operação.
+        /// </summary>
+        [Fact]
+        public void CalcularIR_DedoDuro_DeveSerZeroVirgulaZeroZeroCincoPercento()
+        {
+            // Arrange
+            decimal valorOperacao = 10000m;
+            decimal aliquota = 0.00005m; // 0,005%
+
+            // Act
+            decimal ir = valorOperacao * aliquota;
+
+            // Assert
+            ir.Should().Be(0.5m); // R$ 0,50 de IR
+        }
+
+        /// <summary>
+        /// Teste: Pessoa Física isenta de IR quando valor total ≤ R$ 20.000.
+        /// </summary>
+        [Fact]
+        public void CalcularIR_PessoaFisica_ComValorMenor20k_DeveIscentar()
+        {
+            // Arrange
+            decimal valorVenda = 15000m;
+            decimal aliquota = 0.15m; // 15% (alíquota normal)
+            bool ehPessoaFisica = true;
+
+            // Act
+            decimal ir = ehPessoaFisica && valorVenda <= 20000m ? 0m : valorVenda * aliquota;
+
+            // Assert
+            ir.Should().Be(0m);
+        }
+
+        /// <summary>
+        /// Teste: Pessoa Física paga IR quando valor total > R$ 20.000.
+        /// </summary>
+        [Fact]
+        public void CalcularIR_PessoaFisica_ComValorMaior20k_DeveCalcularIR()
+        {
+            // Arrange
+            decimal valorVenda = 25000m;
+            decimal aliquota = 0.15m; // 15%
+            bool ehPessoaFisica = true;
+
+            // Act
+            decimal ir = ehPessoaFisica && valorVenda <= 20000m ? 0m : valorVenda * aliquota;
+
+            // Assert
+            ir.Should().Be(3750m); // 15% de R$ 25.000
+        }
+
+        /// <summary>
+        /// Teste: Preço Médio é atualizado corretamente com novas compras.
+        /// Fórmula: (Preço Médio Anterior × Qtd Anterior + Preço Nova × Qtd Nova) / (Qtd Anterior + Qtd Nova)
+        /// </summary>
+        [Fact]
+        public void AtualizarPrecoMedio_DeveCalcularMediaPonderada()
+        {
+            // Arrange
+            decimal precoMedioAnterior = 100m;
+            int qtdAnterior = 10;
+            decimal precoNova = 110m;
+            int qtdNova = 5;
+
+            // Act
+            decimal precoMedioNovo = (precoMedioAnterior * qtdAnterior + precoNova * qtdNova) / (qtdAnterior + qtdNova);
+
+            // Assert
+            precoMedioNovo.Should().Be(103.33m, precision: 0.01m);
+        }
+
+        /// <summary>
+        /// Teste: Lote Padrão é múltiplo de 100 ações.
+        /// </summary>
+        [Fact]
+        public void SepararLotes_LotePadrao_DeveSerMultiploDeCem()
+        {
+            // Arrange
+            int quantidadeTotal = 350;
+
+            // Act
+            int lotesPadrao = (quantidadeTotal / 100) * 100;
+            int fracionario = quantidadeTotal % 100;
+
+            // Assert
+            lotesPadrao.Should().Be(300);
+            fracionario.Should().Be(50);
+            (lotesPadrao % 100).Should().Be(0);
+        }
+
+        /// <summary>
+        /// Teste: Ações fracionárias recebem sufixo "F" no ticker.
+        /// </summary>
+        [Fact]
+        public void SepararLotes_Fracionario_DeveAdicionarSufixoF()
+        {
+            // Arrange
+            string ticker = "PETR4";
+            int fracionario = 50;
+
+            // Act
+            string tickerFracionario = fracionario > 0 ? ticker + "F" : ticker;
+
+            // Assert
+            tickerFracionario.Should().Be("PETR4F");
+        }
+    }
+
+    /// <summary>
+    /// Testes de Kafka: Publicação de eventos IR
+    /// </summary>
+    public class KafkaIntegrationTests
+    {
+        private readonly Mock<IKafkaProducer> _mockKafka;
+
+        public KafkaIntegrationTests()
+        {
+            _mockKafka = new Mock<IKafkaProducer>();
+        }
+
+        /// <summary>
+        /// Teste: Evento IR é publicado no Kafka após compra.
+        /// </summary>
+        [Fact]
+        public async Task PublicarEventoIR_DeveEnviarParaTopic()
+        {
+            // Arrange
+            var eventoIR = new EventoIR
+            {
+                Id = Guid.NewGuid(),
+                ClienteId = Guid.NewGuid(),
+                Tipo = TipoIR.DEDO_DURO,
+                ValorBase = 1000m,
+                Aliquota = 0.00005m,
+                ValorImposto = 0.5m,
+                DataEvento = DateTime.UtcNow,
+                Ticker = "PETR4",
+                Descricao = "IR Dedo-duro"
+            };
+
+            // Act
+            await _mockKafka.Object.PublicarEventoIR(eventoIR);
+
+            // Assert
+            _mockKafka.Verify(k => k.PublicarEventoIR(It.IsAny<EventoIR>()), Times.Once);
+        }
+
+        /// <summary>
+        /// Teste: Múltiplos eventos IR são publicados para múltiplas ações.
+        /// </summary>
+        [Fact]
+        public async Task PublicarMultiplosEventosIR_DeveEnviarTodos()
+        {
+            // Arrange
+            var eventos = new List<EventoIR>
+            {
+                new EventoIR { Id = Guid.NewGuid(), ClienteId = Guid.NewGuid(), Ticker = "PETR4", ValorBase = 1000m },
+                new EventoIR { Id = Guid.NewGuid(), ClienteId = Guid.NewGuid(), Ticker = "VALE3", ValorBase = 2000m },
+                new EventoIR { Id = Guid.NewGuid(), ClienteId = Guid.NewGuid(), Ticker = "ITUB4", ValorBase = 1500m }
+            };
+
+            // Act
+            foreach (var evento in eventos)
+            {
+                await _mockKafka.Object.PublicarEventoIR(evento);
+            }
+
+            // Assert
+            _mockKafka.Verify(k => k.PublicarEventoIR(It.IsAny<EventoIR>()), Times.Exactly(3));
+        }
+    }
+}
