@@ -1,5 +1,12 @@
 # Compra Programada de Ações
 
+![.NET 8](https://img.shields.io/badge/.NET%208-512BD4?logo=dotnet&logoColor=white)
+![Angular 17](https://img.shields.io/badge/Angular%2017-DD0031?logo=angular&logoColor=white)
+![MySQL 8](https://img.shields.io/badge/MySQL%208-4479A1?logo=mysql&logoColor=white)
+![Apache Kafka](https://img.shields.io/badge/Apache%20Kafka-231F20?logo=apachekafka&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
+
 > **Aviso:** projeto de estudo desenvolvido a partir de um desafio técnico público de engenharia
 > de software. Sem qualquer afiliação, patrocínio ou endosso de instituições financeiras. Marcas,
 > tickers e dados de mercado citados pertencem aos respectivos titulares.
